@@ -10,11 +10,12 @@ from rest_framework import status
 from .models import CarNumberPlate
 from .serializers import NumberPlateSerializer
 import cv2
+import easyocr
 import numpy as np
-import pytesseract
 import os
 import threading
-import time
+from datetime import datetime
+from django.utils import timezone
 from django.views.decorators import gzip
 from django.utils.decorators import method_decorator
 from PIL import Image
@@ -24,8 +25,11 @@ import pytz
 from google.cloud import vision
 import io
 import geocoder
+from ultralytics import YOLO
+import cvzone
+import math
 
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'  # Adjust this path as needed
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'  # Adjust this path as needed
 # class ANPRView(APIView):
 #     def post(self, request, *args, **kwargs):
 #         file = request.FILES['image']
@@ -80,14 +84,35 @@ pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tessera
 #         return text
 
 class ANPRViewcc(APIView):
-    # camera_url = 'rtsp://admin:abe%40123456@192.168.1.105/Streaming/Channels/401'
-    camera_url='rtsp://admin:abe@123456@192.168.1.105:554/stream1'
+    # camera_url = 'rtsp://admin:abe%40123456@192.168.5.105/Streaming/Channels/401'
+    camera_url = 'rtsp://admin:abe@123456@192.168.5.103:554/stream1'
     # camera_url ='DS-2CD043G2-I(U)'
+    # camera_index = 0 
+
+    def __init__(self):
+        self.model = YOLO('yolov8n.pt')
+        self.classNames = ["person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck", "boat", "traffic light",
+                           "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+                           "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+                           "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
+                           "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+                           "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "sofa",
+                           "pottedplant", "bed", "diningtable", "toilet", "tvmonitor", "laptop", "mouse", "remote", "keyboard",
+                           "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+                           "scissors", "teddy bear", "hair drier", "toothbrush"]
+        self.reader = easyocr.Reader(['en'])  # Initi
+
     def post(self, request, *args, **kwargs):
         print("Received POST request")
         image, image_path = self.capture_frame()
         if image is None:
             return Response({'error': 'Failed to capture frame from camera'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # Detect objects using YOLO model
+        objects_detected = self.detect_objects(image)
+        if not objects_detected:
+            return Response({'error': 'No relevant objects detected'}, status=status.HTTP_200_OK)
+
         edged = self.preprocess_image(image)
         if edged is None:
             return Response({'error': 'Failed to preprocess image'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -95,31 +120,18 @@ class ANPRViewcc(APIView):
         plate = self.detect_plate(image, edged)
         if plate is not None:
             text = self.recognize_plate(image, plate)
-            location = request.data.get('location') or self.get_location_from_ip(request)
-            print(text,location,'this is text')
-            self.save_plate_to_database(text,location)
-        else:  
+            print(text,'this is text')
+            self.save_plate_to_database(text)
+        else:
             text = 'No plate detected'
-
-        # Call extract_text_from_image using the saved image path
-        extracted_text = self.extract_text_from_image(image_path)
 
         response_data = {
             'plate': text,
-            # 'extracted_text': extracted_text,
         }
 
         return Response(response_data, status=status.HTTP_200_OK)
-    def get_location_from_ip(self, request):
-        try:
-            ip = request.META.get('REMOTE_ADDR', None)
-            if ip:
-                g = geocoder.ip(ip)
-                if g.ok:
-                    return f"{g.city}, {g.state}, {g.country}"
-        except Exception as e:
-            print(f"Exception in get_location_from_ip: {e}")
-        return "Unknown Location"
+
+    
 
     def capture_frame(self):
         print("Attempting to capture frame from RTSP stream")
@@ -136,7 +148,7 @@ class ANPRViewcc(APIView):
                 print("Failed to capture frame")
                 return None, None
 
-            scale_percent = 50  # Percent of original size (adjust as needed)
+            scale_percent =60  # Percent of original size (adjust as needed)
             width = int(frame.shape[1] * scale_percent / 100)
             height = int(frame.shape[0] * scale_percent / 100)
             resized_frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
@@ -155,14 +167,42 @@ class ANPRViewcc(APIView):
         except Exception as e:
             print(f"Exception in capture_frame: {e}")
             return None, None
-    
+
+    def detect_objects(self, image):
+        print("Detecting objects in the image")
+        results = self.model(image)
+        detected_objects = []
+        FOCAL_LENGTH = 1271  # You need to calibrate this for your specific camera setup
+        REAL_WIDTH = 1.8  # Real width of a car in meters (average)
+        for r in results:
+            boxes = r.boxes
+            for box in boxes:
+                cls = int(box.cls[0])
+                if self.classNames[cls] in ["bicycle", "car","person", "motorbike","truck"]:
+                    detected_objects.append(self.classNames[cls])
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    w, h = x2 - x1, y2 - y1
+                    distance = (REAL_WIDTH * FOCAL_LENGTH) / w  # Distance estimation
+                    if distance >= 3.048:  # 10 feet in meters
+                        detected_objects.append(self.classNames[cls])
+                        cvzone.cornerRect(image, (x1, y1, w, h), l=9)
+                        conf = math.ceil((box.conf[0] * 100)) / 100
+                        if conf > 0.4:
+                            cvzone.putTextRect(image, f'{self.classNames[cls]} {conf} {distance:.2f}m', (max(0, x1), max(35, y1)),
+                                           scale=0.6, thickness=1, offset=3)
+        cv2.imshow('Detected Objects', image)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+        return detected_objects
+
     def preprocess_image(self, image):
         print("Preprocessing image")
         try:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            edged = cv2.Canny(blurred, 50, 150)
-            cv2.imshow('processing Frame', edged)
+            edged = cv2.Canny(blurred, 75, 200)
+            cv2.imshow('Processing Frame', edged)
             cv2.waitKey(0)  # Wait for a key press to close the window
             cv2.destroyAllWindows()
 
@@ -191,14 +231,14 @@ class ANPRViewcc(APIView):
                     aspect_ratio = w / float(h)
 
                     # Assuming aspect ratio of license plates is typically between 2 and 5
-                    if 2 < aspect_ratio < 5:
+                    if 0 < aspect_ratio < 5:
                         plate = approx
                         break
 
             if plate is not None:
                 print("Plate detected")
                 cv2.drawContours(image, [plate], -1, (0, 250, 0), 2)
-                cv2.imshow('detecting plate', image)
+                cv2.imshow('Detecting Plate', image)
                 cv2.waitKey(0)
                 cv2.destroyAllWindows()
             else:
@@ -211,7 +251,6 @@ class ANPRViewcc(APIView):
             print(f"Exception in detect_plate: {e}")
             return None
 
-
     def recognize_plate(self, image, plate):
         print("Recognizing plate")
         try:
@@ -222,56 +261,52 @@ class ANPRViewcc(APIView):
             (topx, topy) = (np.min(x), np.min(y))
             (bottomx, bottomy) = (np.max(x), np.max(y))
 
-            cropped = image[topx:bottomx+1, topy:bottomy+1]
-            gray_cropped = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-            text = pytesseract.image_to_string(gray_cropped, config='--psm 8')
-
-            # Filter the recognized text to include only alphanumeric characters
-            text = re.sub(r'[^A-Za-z0-9]', '', text)
-            text = text.strip()
-            return text
+            cropped = image[topx:bottomx + 1, topy:bottomy + 1]
+            result = self.reader.readtext(cropped)
+            if result:
+                text = result[0][-2]
+                # Filter the recognized text to include only alphanumeric characters
+                text = re.sub(r'[^A-Za-z0-9]', '', text)
+                text = text.strip()
+                # Apply additional logic to verify and correct the text
+                if len(text) < 4 or len(text) > 10:
+                    text = 'Invalid plate detected'
+                return text
+            else:
+                return 'No plate detected'
+         
 
         except Exception as e:
             print(f"Exception in recognize_plate: {e}")
             return None
 
-    def extract_text_from_image(self, image_path):
-        print("Extracting text from image")
-        try:
-            img = Image.open(image_path)
-            text = pytesseract.image_to_string(img)
-            text = re.sub(r'[^A-Za-z0-9]', '', text)
-            # print(text,'texting message')
-            return text
-        except Exception as e:
-            print(f"Exception in extract_text_from_image: {e}")
-            return None
-    def save_plate_to_database(self, text,location):
+    def save_plate_to_database(self, text):
         if text and text != 'No plate detected':
             kolkata_tz = pytz.timezone('Asia/Kolkata')
             detected_at = timezone.localtime(timezone.now(), kolkata_tz)
-            car_plate = CarNumberPlate(number_plate=text, detected_at=detected_at,location=location)
+            car_plate = CarNumberPlate(number_plate=text, detected_at=detected_at)
             car_plate.save()
-            print(f"Saved {text} to database at {detected_at} with location {location}")
-           
+            print(f"Saved {text} to database at {detected_at}")
+
+
 class CarNumberPlateListView(APIView):
     def get(self, request, *args, **kwargs):
         plates = CarNumberPlate.objects.all()
-        serializer = CarNumberPlateSerializer(plates, many=True)
+        serializer = NumberPlateSerializer(plates, many=True)
         return Response(serializer.data)
 
 
 
 class VideoCamera:
     def __init__(self):
-        self.video = cv2.VideoCapture('rtsp://admin:abe@123456@192.168.1.105:554/stream1')
+        self.video = cv2.VideoCapture('rtsp://admin:abe@123456@192.168.5.104:554/stream1')
         if not self.video.isOpened():
             raise ValueError("Unable to open video source")
         (self.grabbed, self.frame) = self.video.read()
         threading.Thread(target=self.update, args=()).start()
 
     def __del__(self):
-        if self.video.isOpened():
+        if self.video.isOpened(): 
             self.video.release()
 
     def get_frame(self):
